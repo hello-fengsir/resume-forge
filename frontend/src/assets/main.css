@@ -1,0 +1,113 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background: var(--bg-body);
+  color: var(--text-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ═══════════ NaiveUI 全局覆盖 ═══════════ */
+.n-card {
+  background: var(--bg-card) !important;
+  border-radius: var(--radius-xl) !important;
+  border: 1px solid var(--border-default) !important;
+  box-shadow: var(--shadow-sm) !important;
+}
+.n-data-table {
+  background: var(--bg-card) !important;
+  border-radius: var(--radius-xl) !important;
+  border: 1px solid var(--border-default) !important;
+}
+
+/* 按钮 — GodBiao 圆角风格 */
+.n-button {
+  border-radius: 10px !important;
+  font-weight: 600 !important;
+  transition: all 0.2s ease !important;
+}
+.n-button--primary-type {
+  background: #3B82F6 !important;
+}
+.n-button--primary-type:hover {
+  background: #2563EB !important;
+  box-shadow: 0 4px 12px rgba(37,99,235,0.25) !important;
+}
+.n-button--warning-type.n-button--secondary-type {
+  border-color: #d97706 !important;
+  color: #d97706 !important;
+}
+.n-button--info-type.n-button--secondary-type {
+  border-color: #3B82F6 !important;
+  color: #3B82F6 !important;
+}
+
+/* 标签 — 更大更醒目 */
+.n-tag {
+  padding: 10px 24px !important;
+  font-size: 1em !important;
+  border-radius: 24px !important;
+  font-weight: 600 !important;
+  cursor: pointer !important;
+  transition: all 0.2s ease !important;
+  line-height: 1.4 !important;
+  min-height: 42px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+}
+.n-tag--default {
+  background: #fff !important;
+  border: 1px solid #e2e8f0 !important;
+  color: #64748b !important;
+}
+.n-tag--default:hover {
+  border-color: #3B82F6 !important;
+  color: #3B82F6 !important;
+}
+.n-tag--primary {
+  background: #eff6ff !important;
+  color: #2563EB !important;
+  border: 1px solid #bfdbfe !important;
+}
+
+/* 输入框 */
+.n-input .n-input__input-el,
+.n-input .n-input__textarea-el {
+  color: var(--text-heading) !important;
+}
+
+/* ═══════════ 自定义组件类 ═══════════ */
+@layer components {
+  .card-hover {
+    transition: all 0.2s ease;
+  }
+  .card-hover:hover {
+    border-color: var(--border-hover);
+    box-shadow: var(--shadow-md);
+  }
+}
+
+/* Category filter row — bigger spacing */
+.cat-filters {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+/* 表格列宽与溢出控制 */
+.n-data-table table {
+  table-layout: fixed !important;
+  border-spacing: 12px 0 !important;
+  border-collapse: separate !important;
+}
+.n-data-table td,
+.n-data-table th {
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  word-break: break-all !important;
+}
+.n-data-table .n-tag {
+  white-space: nowrap !important;
+}

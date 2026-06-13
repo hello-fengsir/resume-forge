@@ -1,0 +1,61 @@
+"""简历生成引擎 — 动态读取 API Key"""
+import json, re
+from sqlalchemy import select
+from openai import AsyncOpenAI
+from app.config import get_settings
+from app import model_config as _mc
+from app.models.api_key import ApiKey
+from app.routers.config import PROVIDERS, _decrypt
+
+class GenerateEngine:
+    def __init__(self):
+        pass  # No hardcoded client — get it dynamically per request
+
+    async def _get_client(self, db) -> AsyncOpenAI:
+        """Build an AsyncOpenAI client from the active API key in the database."""
+        model = await _mc.get_active_model("generate", db)
+        result = await db.execute(
+            select(ApiKey).where(
+                ApiKey.model == model,
+                ApiKey.is_active == True,
+            ).order_by(ApiKey.created_at.desc())
+        )
+        key_row = result.scalars().first()
+        if not key_row:
+            result2 = await db.execute(
+                select(ApiKey).where(ApiKey.is_active == True).order_by(ApiKey.created_at.desc())
+            )
+            key_row = result2.scalars().first()
+        if not key_row:
+            s = get_settings()
+            return AsyncOpenAI(api_key=s.DEEPSEEK_API_KEY, base_url=s.DEEPSEEK_BASE_URL)
+
+        api_key = _decrypt(key_row.encrypted_key)
+        provider_info = PROVIDERS.get(key_row.provider, {})
+        base_url = provider_info.get("base_url", "https://api.deepseek.com")
+        return AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+    async def _call(self, system: str, user: str, db, max_tokens=3072) -> str:
+        client = await self._get_client(db)
+        model = await _mc.get_active_model("generate", db)
+        resp = await client.chat.completions.create(
+            model=model, max_tokens=max_tokens,
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        )
+        return resp.choices[0].message.content or ""
+
+    async def gen_core(self, info: str, job: str, focus: list, db=None) -> str:
+        f = "\n".join(f"- {x}" for x in focus)
+        return await self._call("撰写简历核心优势，含3-5条含量化数据。", f"岗位：{job}\n重点：{f}\n信息：{info}", db)
+
+    async def gen_work(self, info: str, job: str, db=None) -> str:
+        return await self._call("撰写工作经历，STAR法则，量化优先。", f"岗位：{job}\n信息：{info}", db)
+
+    async def gen_projects(self, info: str, job: str, db=None) -> str:
+        return await self._call("撰写项目经验，突出技术栈和量化成果。", f"岗位：{job}\n信息：{info}", db)
+
+    async def gen_education(self, info: str, db=None) -> str:
+        return await self._call("提取教育经历。", info, db, 1024)
+
+    async def merge(self, core: str, work: str, projects: str, edu: str, job: str, db=None) -> str:
+        return await self._call("融合为完整Markdown简历。", f"核心优势：{core}\n工作经历：{work}\n项目经验：{projects}\n教育：{edu}", db, 4096)

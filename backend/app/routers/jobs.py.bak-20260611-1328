@@ -1,0 +1,175 @@
+"""岗位分析路由 — 含企业调研"""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from uuid import UUID
+import json
+from app.database import get_db
+from app.models.job_analysis import JobAnalysis
+from app.models.info_entry import InfoEntry
+from openai import AsyncOpenAI
+from app.services.analysis_engine import AnalysisEngine
+from app.config import get_settings
+
+router = APIRouter()
+engine = AnalysisEngine()
+
+
+@router.post("/analyze-screenshot")
+async def analyze_screenshot(data: dict, db: AsyncSession = Depends(get_db)):
+    """上传截图 → AI 提取文字 → 分析岗位"""
+    import base64 as b64
+    image_b64 = data.get("image", "")
+    if not image_b64:
+        raise HTTPException(400, "请提供图片 base64 数据")
+
+    # 去掉 data:image/...;base64, 前缀
+    if "," in image_b64:
+        image_b64 = image_b64.split(",", 1)[1]
+
+    # OCR 提取文字
+    import io, pytesseract
+    from PIL import Image
+    img_bytes = b64.b64decode(image_b64)
+    img = Image.open(io.BytesIO(img_bytes))
+    ocr_text = pytesseract.image_to_string(img, lang='chi_sim+eng')
+
+    if not ocr_text.strip():
+        raise HTTPException(400, "未能从截图中提取到文字")
+
+    # 喂给分析引擎
+    structured = await engine.extract_requirement(ocr_text, db)
+    result = await db.execute(select(InfoEntry).order_by(InfoEntry.created_at.desc()))
+    entries = result.scalars().all()
+    info = "\n\n".join(f"[{e.category.value}] {e.title}\n{e.content or ''}" for e in entries)
+    match = await engine.match_analysis(structured, info, db)
+
+    company = structured.get("company") or "未知公司"
+    job_title = structured.get("title") or "未识别岗位"
+    enterprise_info, recommendation = await engine.research_enterprise(company, job_title)
+    advice = await engine.generate_advice(match, enterprise_info, recommendation, db)
+
+    job = JobAnalysis(
+        title=job_title, company=company,
+        raw_requirement=ocr_text,
+        structured_req=structured, match_result=match,
+        resume_focus={"focus": match.get("resume_focus", []), "strategy": match.get("resume_strategy", "")},
+        enterprise_info=enterprise_info, recommendation=recommendation,
+    )
+    db.add(job); await db.commit(); await db.refresh(job)
+
+    result_dict = _fmt(job)
+    result_dict["advice"] = advice
+    result_dict["ocr_text"] = ocr_text
+    return result_dict
+
+
+@router.post("/analyze")
+async def analyze_job(data: dict, db: AsyncSession = Depends(get_db)):
+    req_text = data.get("requirement", "")
+    if not req_text:
+        raise HTTPException(400, "请提供岗位要求")
+
+    # 1. 提取岗位结构
+    structured = await engine.extract_requirement(req_text, db)
+
+    # 2. 简历匹配
+    result = await db.execute(select(InfoEntry).order_by(InfoEntry.created_at.desc()))
+    entries = result.scalars().all()
+    info = "\n\n".join(f"[{e.category.value}] {e.title}\n{e.content or ''}" for e in entries)
+    match = await engine.match_analysis(structured, info, db)
+
+    # 3. 企业调研
+    company = structured.get("company", "")
+    job_title = structured.get("title", "")
+    enterprise_info, recommendation = await engine.research_enterprise(company, job_title)
+
+    # 4. 投递建议
+    advice = await engine.generate_advice(match, enterprise_info, recommendation, db)
+
+    job = JobAnalysis(
+        title=job_title,
+        company=company,
+        raw_requirement=req_text,
+        source_url=data.get("source_url"),
+        structured_req=structured,
+        match_result=match,
+        resume_focus={"focus": match.get("resume_focus", []), "strategy": match.get("resume_strategy", "")},
+        enterprise_info=enterprise_info,
+        recommendation=recommendation,
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    result_dict = _fmt(job)
+    result_dict["advice"] = advice
+    return result_dict
+
+
+@router.post("/{job_id}/research")
+async def research_enterprise(job_id: str, db: AsyncSession = Depends(get_db)):
+    """单独触发企业调研（用于已有分析记录）"""
+    r = await db.execute(select(JobAnalysis).where(JobAnalysis.id == UUID(job_id)))
+    job = r.scalar_one_or_none()
+    if not job:
+        raise HTTPException(404, "不存在")
+
+    company = job.company or ""
+    if not company:
+        raise HTTPException(400, "该分析未识别到公司名")
+
+    enterprise_info, recommendation = await engine.research_enterprise(company, job.title or "")
+    match = job.match_result or {}
+    advice = await engine.generate_advice(match, enterprise_info, recommendation, db)
+
+    job.enterprise_info = enterprise_info
+    job.recommendation = recommendation
+    await db.commit()
+    await db.refresh(job)
+
+    result = _fmt(job)
+    result["advice"] = advice
+    return result
+
+
+@router.get("/")
+async def list_jobs(db: AsyncSession = Depends(get_db)):
+    r = await db.execute(select(JobAnalysis).order_by(JobAnalysis.created_at.desc()))
+    return [_fmt(j) for j in r.scalars().all()]
+
+
+@router.get("/{job_id}")
+async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
+    r = await db.execute(select(JobAnalysis).where(JobAnalysis.id == UUID(job_id)))
+    j = r.scalar_one_or_none()
+    if not j:
+        raise HTTPException(404, "不存在")
+    return _fmt(j)
+
+
+@router.delete("/{job_id}")
+async def delete_job(job_id: str, db: AsyncSession = Depends(get_db)):
+    r = await db.execute(select(JobAnalysis).where(JobAnalysis.id == UUID(job_id)))
+    j = r.scalar_one_or_none()
+    if not j:
+        raise HTTPException(404, "不存在")
+    await db.delete(j)
+    await db.commit()
+    return {"deleted": True}
+
+
+def _fmt(j):
+    return {
+        "id": str(j.id),
+        "title": j.title,
+        "company": j.company,
+        "raw_requirement": j.raw_requirement,
+        "source_url": j.source_url,
+        "structured_req": j.structured_req,
+        "match_result": j.match_result,
+        "resume_focus": j.resume_focus,
+        "enterprise_info": j.enterprise_info,
+        "recommendation": j.recommendation,
+        "created_at": j.created_at.isoformat(),
+    }

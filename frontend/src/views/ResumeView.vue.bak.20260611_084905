@@ -1,0 +1,184 @@
+<script setup lang="ts">
+import { onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { NButton, NCard, NSpin, NSpace, NTag, NEmpty, NProgress, NPopconfirm, useMessage } from 'naive-ui'
+import { useResumeStore } from '../stores/resume'
+import { useJobsStore } from '../stores/jobs'
+
+const store = useResumeStore()
+const jobsStore = useJobsStore()
+const route = useRoute()
+const router = useRouter()
+const message = useMessage()
+const jobId = route.params.jobId as string
+
+const currentTab = ref<string>('full')
+const genError = ref('')
+
+function normScore(raw: any): number {
+  if (raw == null) return 0
+  const n = Number(raw)
+  if (isNaN(n)) return 0
+  return n <= 1 ? Math.round(n * 100) : Math.round(n)
+}
+
+onMounted(async () => {
+  await store.fetchAll()
+  await jobsStore.fetchAll()
+  if (jobId) {
+    genError.value = ''
+    try {
+      await store.generate(jobId)
+      message.success('简历生成完成')
+    } catch (e: any) {
+      genError.value = e.response?.data?.detail || e.message || '生成失败'
+      message.error('生成失败: ' + genError.value)
+    }
+  }
+})
+
+// Watch route param for component reuse (e.g. clicking "生成简历" from resume page)
+watch(() => route.params.jobId, (newId) => {
+  if (newId) {
+    genError.value = ''
+    store.generate(newId as string).then(() => {
+      // success
+    }).catch((e: any) => {
+      genError.value = e.response?.data?.detail || e.message || '生成失败'
+    })
+  }
+})
+
+const tabs = [
+  { key: 'full', label: '📄 完整简历' },
+  { key: 'strengths', label: '💪 核心优势' },
+  { key: 'work', label: '💼 工作经历' },
+  { key: 'projects', label: '🚀 项目经验' },
+  { key: 'education', label: '🎓 教育经历' },
+]
+
+function formatContent(content: string | null): string {
+  if (!content) return ''
+  try {
+    const obj = JSON.parse(content)
+    return obj.summary || obj.strengths?.join('\n') || obj.items?.map((i: any) => `- ${i.title || i.company || i.name}`).join('\n') || content
+  } catch { return content }
+}
+
+function generateFrom(jobId: string) {
+  router.push(`/resume/${jobId}`)
+}
+
+async function viewResume(id: string) {
+  await store.getResume(id)
+  currentTab.value = 'full'
+}
+
+async function handleDeleteResume(id: string) {
+  await store.deleteResume(id)
+  message.success('已删除')
+}
+</script>
+
+<template>
+  <div>
+    <h2 class="text-2xl font-bold text-blue-600 mb-6">📝 制作简历</h2>
+
+    <!-- 无参数：选择入口 -->
+    <n-card v-if="!store.current && !jobId" class="bg-white border border-slate-200 mb-4">
+      <n-empty description="尚未生成简历">
+        <template #extra>
+          <n-space vertical align="center">
+            <p class="text-slate-500 text-sm">从应聘分析中选择一个岗位，AI 将基于你的信息库自动生成定制简历</p>
+            <router-link to="/jobs">
+              <n-button type="primary" size="large">📋 前往应聘分析选择岗位</n-button>
+            </router-link>
+          </n-space>
+        </template>
+      </n-empty>
+    </n-card>
+
+    <!-- 生成中 / 等待中：loading 状态 -->
+    <n-card v-if="jobId && !store.current && !genError" class="bg-white border border-slate-200 mb-4">
+      <div class="text-center py-12">
+        <n-spin :show="true" size="large">
+          <div class="h-20"></div>
+        </n-spin>
+        <p class="text-lg font-medium text-blue-600 mt-4">
+          {{ store.generating ? '⏳ AI 正在生成定制简历...' : '🔄 准备生成...' }}
+        </p>
+        <p class="text-sm text-slate-400 mt-2">
+          {{ store.generating ? '正在调用大模型，依次生成核心优势→工作经历→项目经验→教育经历，预计 1-3 分钟' : '正在加载数据...' }}
+        </p>
+      </div>
+    </n-card>
+
+    <!-- 生成失败 -->
+    <n-card v-if="genError && !store.current" class="bg-white border border-red-200 mb-4">
+      <div class="text-center py-8">
+        <p class="text-lg text-red-500 mb-2">❌ {{ genError }}</p>
+        <p class="text-sm text-slate-400 mb-4">请确认已在侧边栏配置有效的 API Key</p>
+        <n-button type="primary" @click="generateFrom(jobId)">🔄 重试</n-button>
+      </div>
+    </n-card>
+
+    <!-- 已有简历：Tab + 内容 -->
+    <template v-if="store.current">
+      <div class="flex gap-2 mb-4 flex-wrap">
+        <n-tag v-for="tab in tabs" :key="tab.key"
+          :type="currentTab === tab.key ? 'primary' : 'default'"
+          :bordered="false" class="cursor-pointer" @click="currentTab = tab.key">
+          {{ tab.label }}
+        </n-tag>
+      </div>
+
+      <n-card class="bg-white border border-slate-200">
+        <div v-if="currentTab === 'full'" class="whitespace-pre-wrap text-slate-500 leading-relaxed">
+          {{ store.current.full_resume || '内容生成中...' }}
+        </div>
+        <div v-else class="whitespace-pre-wrap text-slate-500 leading-relaxed">
+          {{ formatContent(
+            currentTab === 'strengths' ? store.current.core_strengths :
+            currentTab === 'work' ? store.current.work_experience :
+            currentTab === 'projects' ? store.current.project_exp :
+            store.current.education
+          ) }}
+        </div>
+      </n-card>
+    </template>
+
+    <!-- 从应聘分析快速生成 -->
+    <n-card v-if="jobsStore.analyses.length > 0" title="📋 选择岗位快速生成" class="bg-white border border-slate-200 mt-4" size="small">
+      <div v-for="j in jobsStore.analyses" :key="j.id" class="flex items-center justify-between py-2 border-b border-slate-100 last:border-0">
+        <div>
+          <span class="font-medium">{{ j.title }}</span>
+          <span class="text-slate-400 ml-2">@ {{ j.company }}</span>
+          <n-tag :type="normScore(j.match_result?.overall_match)>=70?'success':'warning'" size="tiny" class="ml-2">匹配 {{ normScore(j.match_result?.overall_match) }}%</n-tag>
+        </div>
+        <n-button size="tiny" type="primary" @click="generateFrom(j.id)">生成简历</n-button>
+      </div>
+    </n-card>
+
+    <!-- 历史版本 -->
+    <n-card v-if="store.resumes.length > 0" title="📜 历史版本" class="bg-white border border-slate-200 mt-4" size="small">
+      <div v-for="r in store.resumes" :key="r.id" class="flex items-center justify-between py-2 border-b border-slate-100 last:border-0">
+        <div>
+          <span>版本 {{ r.version }}</span>
+          <span v-if="r.job_title" class="text-slate-500 text-sm ml-2">{{ r.job_title }} @ {{ r.company }}</span>
+          <n-tag :type="r.status === 'reviewed' ? 'success' : 'default'" size="tiny" class="ml-2">{{ r.status }}</n-tag>
+          <span class="text-slate-400 text-sm ml-2">{{ r.created_at?.slice(0, 10) }}</span>
+        </div>
+        <n-space>
+          <n-button size="tiny" @click="viewResume(r.id)">查看</n-button>
+          <router-link :to="`/review/${r.id}`">
+            <n-button size="tiny" type="warning">评估</n-button>
+          </router-link>
+          <n-popconfirm @positive-click="() => handleDeleteResume(r.id)">
+            <template #trigger><n-button size="tiny" type="error">删除</n-button></template>
+            确认删除版本 {{ r.version }}？
+          </n-popconfirm>
+        </n-space>
+      </div>
+    </n-card>
+  </div>
+</template>

@@ -1,0 +1,360 @@
+<script setup lang="ts">
+import { onMounted, ref, h } from 'vue'
+import { NButton, NInput, NSelect, NUpload, NDataTable, NModal, NPopconfirm, NTag, NSpace, NCard, NSpin, NCheckbox, useMessage } from 'naive-ui'
+import type { UploadFileInfo } from 'naive-ui'
+import { useInfoStore } from '../stores/info'
+import type { OptimizeResult, DuplicateResult, DuplicateGroup } from '../api/info'
+
+const store = useInfoStore()
+const message = useMessage()
+
+const categoryOptions = [
+  { label: '全部', value: '' },
+  { label: '工作经历', value: 'work_experience' },
+  { label: '项目经验', value: 'project' },
+  { label: '教育经历', value: 'education' },
+  { label: '技能', value: 'skill' },
+  { label: '证书', value: 'certification' },
+  { label: '学习能力', value: 'self_learning' },
+]
+
+const showModal = ref(false)
+const form = ref({ title: '', category: 'work_experience', company: '', content: '' })
+const editingId = ref<string | null>(null)
+
+// Optimize state
+const optimizeModal = ref(false)
+const optimizing = ref(false)
+const optimizeResult = ref<OptimizeResult | null>(null)
+const optimizeEntryId = ref<string>('')
+
+// Dedup state
+const dedupModal = ref(false)
+const dedupLoading = ref(false)
+const dedupResult = ref<DuplicateResult | null>(null)
+const merging = ref(false)
+const selectedGroupIdx = ref<Set<number>>(new Set())
+
+onMounted(() => store.fetchEntries())
+
+const columns = [
+  { title: '分类', key: 'category', width: 100, render: (row: any) => h(NTag, { type: 'info', size: 'small' }, () => row.category) },
+  { title: '标题', key: 'title', ellipsis: { tooltip: true } },
+  { title: '公司/机构', key: 'company', width: 130 },
+  { title: '时间', key: 'date', width: 150, render: (row: any) => row.start_date ? `${row.start_date} ~ ${row.end_date || '至今'}` : '-' },
+  {
+    title: '操作', key: 'actions', width: 220,
+    render: (row: any) => h(NSpace, () => [
+      h(NButton, { size: 'tiny', type: 'info', secondary: true, onClick: () => handleOptimize(row) }, () => 'AI 调优'),
+      h(NButton, { size: 'tiny', onClick: () => editEntry(row) }, () => '编辑'),
+      h(NPopconfirm, { onPositiveClick: () => handleDelete(row.id) }, {
+        trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '删除'),
+        default: () => '确认删除？',
+      }),
+    ]),
+  },
+]
+
+function editEntry(row: any) {
+  editingId.value = row.id
+  form.value = { title: row.title, category: row.category, company: row.company || '', content: row.content || '' }
+  showModal.value = true
+}
+
+async function handleSubmit() {
+  if (editingId.value) {
+    await store.updateEntry(editingId.value, form.value)
+    message.success('已更新')
+  } else {
+    await store.createEntry(form.value)
+    message.success('已创建')
+  }
+  showModal.value = false
+  editingId.value = null
+  form.value = { title: '', category: 'work_experience', company: '', content: '' }
+}
+
+async function handleDelete(id: string) {
+  await store.deleteEntry(id)
+  message.success('已删除')
+}
+
+async function handleUpload({ file }: { file: UploadFileInfo }) {
+  if (!file.file) return
+  message.loading('AI 分析中...')
+  try {
+    await store.uploadFile(file.file)
+    message.success('上传并分析完成')
+  } catch (e: any) {
+    message.error('上传失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+function handleFilter(cat: string) {
+  store.fetchEntries(cat || undefined)
+}
+
+// ── AI 调优 ──
+async function handleOptimize(row: any) {
+  optimizeEntryId.value = row.id
+  optimizeResult.value = null
+  optimizing.value = true
+  optimizeModal.value = true
+  try {
+    optimizeResult.value = await store.optimizeEntry(row.id)
+  } catch (e: any) {
+    message.error('AI 调优失败: ' + (e.response?.data?.detail || e.message))
+    optimizeModal.value = false
+  } finally {
+    optimizing.value = false
+  }
+}
+
+async function confirmOptimize() {
+  if (!optimizeResult.value) return
+  const { title, content } = optimizeResult.value.optimized
+  await store.updateEntry(optimizeEntryId.value, { title, content })
+  message.success('已保存优化结果')
+  optimizeModal.value = false
+  optimizeResult.value = null
+}
+
+// ── 去重合并 ──
+async function handleDetectDuplicates() {
+  dedupLoading.value = true
+  dedupResult.value = null
+  selectedGroupIdx.value = new Set()
+  dedupModal.value = true
+  try {
+    const cat = store.selectedCategory || undefined
+    dedupResult.value = await store.detectDuplicates(cat)
+    if (dedupResult.value.duplicate_groups === 0) {
+      message.success('没有发现重复条目')
+      dedupModal.value = false
+    }
+  } catch (e: any) {
+    message.error('检测失败: ' + (e.response?.data?.detail || e.message))
+    dedupModal.value = false
+  } finally {
+    dedupLoading.value = false
+  }
+}
+
+function toggleGroup(idx: number) {
+  const s = new Set(selectedGroupIdx.value)
+  if (s.has(idx)) s.delete(idx)
+  else s.add(idx)
+  selectedGroupIdx.value = s
+}
+
+function toggleAllGroups() {
+  if (!dedupResult.value) return
+  if (selectedGroupIdx.value.size === dedupResult.value.groups.length) {
+    selectedGroupIdx.value = new Set()
+  } else {
+    selectedGroupIdx.value = new Set(dedupResult.value.groups.map((_, i) => i))
+  }
+}
+
+async function handleMergeGroup(group: DuplicateGroup) {
+  merging.value = true
+  try {
+    const ids = group.entries.map(e => e.id)
+    const result = await store.mergeEntries(ids, false)
+    message.success(`已合并为「${result.merged.title}」，删除 ${result.deleted_count} 条`)
+    // Refresh dedup results
+    const cat = store.selectedCategory || undefined
+    dedupResult.value = await store.detectDuplicates(cat)
+    selectedGroupIdx.value = new Set()
+    if (dedupResult.value.duplicate_groups === 0) {
+      dedupModal.value = false
+      message.success('所有重复已清理')
+    }
+  } catch (e: any) {
+    message.error('合并失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    merging.value = false
+  }
+}
+
+async function handleMergeSelected() {
+  if (!dedupResult.value || selectedGroupIdx.value.size === 0) return
+  merging.value = true
+  try {
+    let totalDeleted = 0
+    for (const idx of selectedGroupIdx.value) {
+      const group = dedupResult.value.groups[idx]
+      const ids = group.entries.map(e => e.id)
+      const result = await store.mergeEntries(ids, false)
+      totalDeleted += result.deleted_count
+    }
+    message.success(`合并完成，清理 ${totalDeleted} 条重复`)
+    const cat = store.selectedCategory || undefined
+    dedupResult.value = await store.detectDuplicates(cat)
+    selectedGroupIdx.value = new Set()
+    if (dedupResult.value.duplicate_groups === 0) {
+      dedupModal.value = false
+    }
+  } catch (e: any) {
+    message.error('合并失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    merging.value = false
+  }
+}
+</script>
+
+<template>
+  <div>
+    <div class="flex items-center justify-between mb-6">
+      <h2 class="text-2xl font-bold text-blue-600">📊 信息统计</h2>
+      <n-space>
+        <n-button type="warning" secondary @click="handleDetectDuplicates">
+          🔍 检测去重
+        </n-button>
+        <n-button type="primary" @click="showModal = true; editingId = null; form = { title: '', category: 'work_experience', company: '', content: '' }">
+          添加条目
+        </n-button>
+      </n-space>
+    </div>
+
+    <!-- 上传区 -->
+    <n-card class="bg-white border border-slate-200 mb-6">
+      <n-upload
+        multiple
+        :max="5"
+        accept=".pdf,.docx,.xlsx,.txt,.md"
+        :on-finish="handleUpload"
+        :show-file-list="true"
+      >
+        <n-button type="primary" secondary>📎 上传文件自动提取（PDF/Word/Excel）</n-button>
+      </n-upload>
+    </n-card>
+
+    <!-- 数据表格 -->
+    <n-dataTable
+      :columns="columns"
+      :data="store.entries"
+      :loading="store.loading"
+      :bordered="false"
+      class="bg-white border border-slate-200 rounded-lg"
+      size="small"
+    />
+
+    <!-- 添加/编辑弹窗 -->
+    <n-modal v-model:show="showModal" preset="card" title="信息条目" style="width: 600px">
+      <n-space vertical>
+        <n-select v-model:value="form.category" :options="categoryOptions.filter(o => o.value)" placeholder="分类" />
+        <n-input v-model:value="form.title" placeholder="标题（如：XX公司系统管理员）" />
+        <n-input v-model:value="form.company" placeholder="公司/机构名称" />
+        <n-input
+          v-model:value="form.content"
+          type="textarea"
+          :rows="6"
+          placeholder="详细内容描述，尽量包含量化数据..."
+        />
+      </n-space>
+      <template #footer>
+        <n-button @click="showModal = false">取消</n-button>
+        <n-button type="primary" @click="handleSubmit">保存</n-button>
+      </template>
+    </n-modal>
+
+    <!-- AI 调优预览弹窗 -->
+    <n-modal v-model:show="optimizeModal" preset="card" title="🤖 AI 调优预览" style="width: 720px" :mask-closable="false">
+      <n-spin :show="optimizing" description="AI 正在优化...">
+        <div v-if="optimizeResult" class="space-y-4">
+          <div v-if="optimizeResult.optimized.improvements?.length" class="bg-blue-50 border border-blue-200 rounded-lg p-3">
+            <div class="text-sm font-semibold text-blue-700 mb-2">📝 改进点</div>
+            <ul class="text-sm text-blue-600 space-y-1">
+              <li v-for="(imp, i) in optimizeResult.optimized.improvements" :key="i">• {{ imp }}</li>
+            </ul>
+          </div>
+          <div class="grid grid-cols-2 gap-4">
+            <div class="border border-gray-200 rounded-lg p-3">
+              <div class="text-xs text-slate-500 mb-1">原标题</div>
+              <div class="text-sm text-slate-600">{{ optimizeResult.original.title }}</div>
+            </div>
+            <div class="border border-green-300 bg-green-50 rounded-lg p-3">
+              <div class="text-xs text-green-600 mb-1">优化标题</div>
+              <div class="text-sm font-semibold text-green-800">{{ optimizeResult.optimized.title }}</div>
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-4">
+            <div class="border border-gray-200 rounded-lg p-3">
+              <div class="text-xs text-slate-500 mb-1">原内容</div>
+              <div class="text-sm text-slate-600 whitespace-pre-wrap">{{ optimizeResult.original.content || '(空)' }}</div>
+            </div>
+            <div class="border border-green-300 bg-green-50 rounded-lg p-3">
+              <div class="text-xs text-green-600 mb-1">优化内容</div>
+              <div class="text-sm text-slate-800 whitespace-pre-wrap">{{ optimizeResult.optimized.content }}</div>
+            </div>
+          </div>
+        </div>
+      </n-spin>
+      <template #footer>
+        <n-button @click="optimizeModal = false" :disabled="optimizing">取消</n-button>
+        <n-button type="primary" @click="confirmOptimize" :disabled="optimizing || !optimizeResult">确认保存</n-button>
+      </template>
+    </n-modal>
+
+    <!-- 去重检测结果弹窗 -->
+    <n-modal v-model:show="dedupModal" preset="card" title="🔍 重复检测结果" style="width: 800px; max-height: 80vh" :mask-closable="false">
+      <n-spin :show="dedupLoading" description="正在扫描重复...">
+        <div v-if="dedupResult && dedupResult.duplicate_groups > 0">
+          <div class="flex items-center justify-between mb-4">
+            <div class="text-sm text-slate-500">
+              共 {{ dedupResult.total_entries }} 条，发现 <span class="text-orange-600 font-bold">{{ dedupResult.duplicate_groups }}</span> 组疑似重复
+            </div>
+            <n-space>
+              <n-button size="small" @click="toggleAllGroups">
+                {{ selectedGroupIdx.size === dedupResult.groups.length ? '取消全选' : '全选' }}
+              </n-button>
+              <n-button size="small" type="primary" :disabled="selectedGroupIdx.size === 0 || merging" @click="handleMergeSelected">
+                批量合并 ({{ selectedGroupIdx.size }})
+              </n-button>
+            </n-space>
+          </div>
+
+          <div class="space-y-3 max-h-[55vh] overflow-y-auto">
+            <div
+              v-for="(group, gi) in dedupResult.groups"
+              :key="gi"
+              class="border rounded-lg p-3"
+              :class="selectedGroupIdx.has(gi) ? 'border-orange-300 bg-orange-50' : 'border-gray-200'"
+            >
+              <div class="flex items-start gap-3">
+                <n-checkbox :checked="selectedGroupIdx.has(gi)" @update:checked="toggleGroup(gi)" class="mt-1" />
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center gap-2 mb-2">
+                    <n-tag size="tiny" type="warning">{{ group.entries.length }} 条重复</n-tag>
+                    <span class="text-sm font-semibold text-slate-700 truncate">{{ group.entries[0].title }}</span>
+                    <span v-if="group.entries[0].company" class="text-xs text-slate-500">@{{ group.entries[0].company }}</span>
+                  </div>
+                  <div class="space-y-1">
+                    <div
+                      v-for="(entry, ei) in group.entries"
+                      :key="ei"
+                      class="text-xs text-slate-500 pl-2 border-l-2 border-gray-200"
+                    >
+                      <span class="text-slate-700">{{ entry.title }}</span>
+                      <span v-if="entry.company" class="text-slate-500 ml-1">@{{ entry.company }}</span>
+                      <span v-if="entry._reason" class="text-orange-500 ml-2">— {{ entry._reason }}</span>
+                    </div>
+                  </div>
+                  <div class="mt-2">
+                    <n-button size="tiny" type="warning" secondary :disabled="merging" @click="handleMergeGroup(group)">
+                      ⚡ 合并此组
+                    </n-button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </n-spin>
+      <template #footer>
+        <n-button @click="dedupModal = false" :disabled="merging">关闭</n-button>
+      </template>
+    </n-modal>
+  </div>
+</template>

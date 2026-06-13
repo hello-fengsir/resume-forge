@@ -1,0 +1,79 @@
+import { defineStore } from 'pinia'
+import { ref } from 'vue'
+import { jobsApi, type JobAnalysis } from '../api/jobs'
+
+export const useJobsStore = defineStore('jobs', () => {
+  const analyses = ref<JobAnalysis[]>([])
+  const current = ref<JobAnalysis | null>(null)
+  const loading = ref(false)
+  const error = ref('')
+
+  async function fetchAll() {
+    loading.value = true
+    error.value = ''
+    try {
+      const res = await jobsApi.list()
+      analyses.value = res.data || []
+      if (analyses.value.length === 0) {
+        error.value = '暂无分析记录'
+      }
+    } catch (e: any) {
+      const msg = e.response?.data?.detail || e.message || '加载失败'
+      error.value = msg
+      // Don't clear existing data on error
+      if (analyses.value.length === 0) {
+        analyses.value = []
+      }
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function analyze(requirement: string, sourceUrl?: string) {
+    loading.value = true
+    try {
+      const res = await jobsApi.analyze({ requirement, source_url: sourceUrl })
+      analyses.value.unshift(res.data)
+      current.value = res.data
+      error.value = ''
+      return res.data
+    } catch (e: any) {
+      const msg = e.response?.data?.detail || e.message || '分析失败'
+      error.value = msg
+      throw e
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function getAnalysis(id: string) {
+    const res = await jobsApi.get(id)
+    current.value = res.data
+    error.value = ''
+    return res.data
+  }
+
+  function updateAnalysis(id: string, data: any) {
+    const idx = analyses.value.findIndex((a) => a.id === id)
+    if (idx !== -1) {
+      analyses.value[idx] = { ...analyses.value[idx], ...data }
+    }
+    if (current.value?.id === id) {
+      current.value = { ...current.value, ...data }
+    }
+  }
+
+  async function saveEdit(id: string, fields: Partial<JobAnalysis>) {
+    const res = await jobsApi.update(id, fields)
+    updateAnalysis(id, res.data)
+    return res.data
+  }
+
+  async function deleteAnalysis(id: string) {
+    await jobsApi.delete(id)
+    analyses.value = analyses.value.filter((a) => a.id !== id)
+    if (current.value?.id === id) current.value = null
+  }
+
+  return { analyses, current, loading, error, fetchAll, analyze, getAnalysis, updateAnalysis, saveEdit, deleteAnalysis }
+})

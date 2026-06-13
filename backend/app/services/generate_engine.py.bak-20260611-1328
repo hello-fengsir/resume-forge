@@ -1,0 +1,34 @@
+"""简历生成引擎"""
+import json, re
+from openai import AsyncOpenAI
+from app.config import get_settings
+from app import model_config as _mc
+
+class GenerateEngine:
+    def __init__(self):
+        s = get_settings()
+        self.client = AsyncOpenAI(api_key=s.DEEPSEEK_API_KEY, base_url=s.DEEPSEEK_BASE_URL)
+        self.model = _mc.get_active_model_sync("generate")
+
+    async def _call(self, system: str, user: str, max_tokens=3072) -> str:
+        resp = await self.client.chat.completions.create(
+            model=self.model, max_tokens=max_tokens,
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        )
+        return resp.choices[0].message.content or ""
+
+    async def gen_core(self, info: str, job: str, focus: list) -> str:
+        f = "\n".join(f"- {x}" for x in focus)
+        return await self._call("撰写简历核心优势，含3-5条含量化数据。", f"岗位：{job}\n重点：{f}\n信息：{info}")
+
+    async def gen_work(self, info: str, job: str) -> str:
+        return await self._call("撰写工作经历，STAR法则，量化优先。", f"岗位：{job}\n信息：{info}")
+
+    async def gen_projects(self, info: str, job: str) -> str:
+        return await self._call("撰写项目经验，突出技术栈和量化成果。", f"岗位：{job}\n信息：{info}")
+
+    async def gen_education(self, info: str) -> str:
+        return await self._call("提取教育经历。", info, 1024)
+
+    async def merge(self, core: str, work: str, projects: str, edu: str, job: str) -> str:
+        return await self._call("融合为完整Markdown简历。", f"核心优势：{core}\n工作经历：{work}\n项目经验：{projects}\n教育：{edu}", 4096)

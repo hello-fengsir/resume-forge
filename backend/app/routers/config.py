@@ -1,0 +1,427 @@
+"""配置管理路由 — API Key（加密存储、绑定用户、支持多服务商）"""
+import os
+import json
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
+
+from app.database import get_db
+from app.model_config import get_active_model, refresh_model_cache, set_active_model
+from app.auth.auth_utils import get_current_user
+from app.models.user import User
+from app.models.api_key import ApiKey
+
+try:
+    from cryptography.fernet import Fernet
+    _fernet = Fernet(os.getenv("ENCRYPTION_KEY", "").encode() or Fernet.generate_key())
+except ImportError:
+    _fernet = None
+
+router = APIRouter()
+
+# ─── 服务商定义 ─────────────────────────────────────────────
+
+PROVIDERS = {
+    "deepseek": {
+        "name": "DeepSeek (深度求索)",
+        "models": ["deepseek-v4-pro", "deepseek-v4", "deepseek-v4-flash"],
+        "base_url": "https://api.deepseek.com",
+        "api_style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "test_path": "/v1/models",
+        "desc": "2026年4月发布 V4 系列",
+    },
+    "qwen": {
+        "name": "阿里云 (通义千问)",
+        "models": ["Qwen3.7-Max", "Qwen3.7-Plus"],
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode",
+        "api_style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "test_path": "/v1/models",
+        "desc": "2026年5月发布 3.7 系列",
+    },
+    "wenxin": {
+        "name": "百度 (文心一言)",
+        "models": ["文心大模型5.1"],
+        "base_url": "https://qianfan.baidubce.com/v2",
+        "api_style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "test_path": "/models",
+        "desc": "2026年5月发布 5.1",
+    },
+    "hunyuan": {
+        "name": "腾讯 (混元)",
+        "models": ["Hy3-preview"],
+        "base_url": "https://api.hunyuan.cloud.tencent.com/v1",
+        "api_style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "test_path": "/models",
+        "desc": "2026年4月发布 Hy3 preview",
+    },
+    "doubao": {
+        "name": "字节跳动 (豆包)",
+        "models": ["豆包2.0-Pro", "豆包2.0-Flash", "豆包2.0-Lite"],
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "api_style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "test_path": "/models",
+        "desc": "2026年2月发布 2.0 系列",
+    },
+    "zhipu": {
+        "name": "智谱AI (GLM)",
+        "models": ["GLM-5.1", "GLM-4.7-Flash"],
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "api_style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "test_path": "/models",
+        "desc": "2026年5月发布 5.1 高速版",
+    },
+    "moonshot": {
+        "name": "月之暗面 (Kimi)",
+        "models": ["Kimi-K2.5"],
+        "base_url": "https://api.moonshot.cn/v1",
+        "api_style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "test_path": "/models",
+        "desc": "2026年1月发布 K2.5",
+    },
+    "minimax": {
+        "name": "MiniMax",
+        "models": ["MiniMax-M3"],
+        "base_url": "https://api.minimax.chat/v1",
+        "api_style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "test_path": "/models",
+        "desc": "2026年6月发布 M3",
+    },
+    "sensenova": {
+        "name": "商汤科技 (日日新)",
+        "models": ["SenseNova-6.7-Flash-Lite"],
+        "base_url": "https://api.sensenova.cn/v1",
+        "api_style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "test_path": "/llm/models",
+        "desc": "2026年5月发布 6.7 Flash-Lite",
+    },
+    "xiaomi": {
+        "name": "小米 (MiMo)",
+        "models": ["mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-flash"],
+        "base_url": "https://api.xiaomimimo.com/v1",
+        "api_style": "openai",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "test_path": "/models",
+        "desc": "小米大模型MiMo，OpenAI兼容",
+    },
+}
+
+# ─── 加密工具 ────────────────────────────────────────────────
+
+def _encrypt(plain: str) -> str:
+    if _fernet is None:
+        return plain  # fallback: no encryption
+    return _fernet.encrypt(plain.encode()).decode()
+
+def _decrypt(encrypted: str) -> str:
+    if _fernet is None:
+        return encrypted
+    try:
+        return _fernet.decrypt(encrypted.encode()).decode()
+    except Exception:
+        return encrypted  # fallback for legacy unencrypted data
+
+# ─── 模型缓存读取 ─────────────────────────────────────────────
+import app.model_config as _mc_mod
+
+def _cache_get(key: str, default: str = "") -> str:
+    """从内存缓存读取模型配置"""
+    val = _mc_mod.get_active_model_sync(key.replace("_model", ""))
+    return val or default
+
+def _mask_key(key: str) -> str:
+    """脱敏显示：前6后4"""
+    if len(key) <= 12:
+        return key[:4] + "****"
+    return key[:6] + "****" + key[-4:]
+
+# ─── Pydantic 模型 ───────────────────────────────────────────
+
+class KeyCreate(BaseModel):
+    provider: str
+    model: str
+    api_key: str
+    name: str = ""
+
+class KeyTest(BaseModel):
+    provider: str
+    model: str
+    api_key: str
+
+class KeyResponse(BaseModel):
+    id: str
+    provider: str
+    provider_name: str
+    model: str
+    name: str
+    masked_key: str
+    is_active: bool
+    last_tested_at: str | None
+    created_at: str
+
+# ─── API 端点 ────────────────────────────────────────────────
+
+@router.get("/providers")
+async def list_providers():
+    """获取支持的服务商列表及模型"""
+    return [
+        {
+            "id": pid,
+            "name": p["name"],
+            "models": p["models"],
+            "desc": p.get("desc", ""),
+        }
+        for pid, p in PROVIDERS.items()
+    ]
+
+@router.get("/api-keys")
+async def list_keys(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """列出当前用户的所有 API Key（脱敏）"""
+    result = await db.execute(
+        select(ApiKey).where(ApiKey.user_id == current_user.id).order_by(ApiKey.created_at.desc())
+    )
+    keys = result.scalars().all()
+    return [
+        {
+            "id": k.id,
+            "provider": k.provider,
+            "provider_name": PROVIDERS.get(k.provider, {}).get("name", k.provider),
+            "model": k.model,
+            "name": k.name,
+            "masked_key": _mask_key(_decrypt(k.encrypted_key)),
+            "is_active": k.is_active,
+            "last_tested_at": k.last_tested_at.isoformat() if k.last_tested_at else None,
+            "created_at": k.created_at.isoformat(),
+        }
+        for k in keys
+    ]
+
+@router.post("/api-keys")
+async def create_key(
+    data: KeyCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """添加新的 API Key"""
+    if data.provider not in PROVIDERS:
+        raise HTTPException(400, f"不支持的服务商: {data.provider}")
+
+    encrypted = _encrypt(data.api_key)
+    key = ApiKey(
+        provider=data.provider,
+        model=data.model,
+        name=data.name,
+        encrypted_key=encrypted,
+        user_id=current_user.id,
+    )
+    db.add(key)
+    await db.commit()
+    await db.refresh(key)
+    return {"ok": True, "id": key.id}
+
+@router.delete("/api-keys/{key_id}")
+async def delete_key(
+    key_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """删除 API Key"""
+    result = await db.execute(
+        select(ApiKey).where(ApiKey.id == key_id, ApiKey.user_id == current_user.id)
+    )
+    key = result.scalar_one_or_none()
+    if not key:
+        raise HTTPException(404, "Key 不存在")
+    await db.delete(key)
+    await db.commit()
+    return {"ok": True}
+
+@router.post("/api-keys/{key_id}/activate")
+async def activate_key(
+    key_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """激活/停用 Key"""
+    result = await db.execute(
+        select(ApiKey).where(ApiKey.id == key_id, ApiKey.user_id == current_user.id)
+    )
+    key = result.scalar_one_or_none()
+    if not key:
+        raise HTTPException(404, "Key 不存在")
+
+    new_state = not key.is_active
+    await db.execute(
+        update(ApiKey).where(ApiKey.id == key_id).values(is_active=new_state)
+    )
+    await db.commit()
+    return {"ok": True, "is_active": new_state}
+
+@router.post("/api-keys/test")
+async def test_key(data: KeyTest):
+    """测试 API Key 有效性（不保存）"""
+    return await _do_test(data.provider, data.api_key)
+
+@router.post("/api-keys/{key_id}/test")
+async def test_saved_key(key_id: str, db: AsyncSession = Depends(get_db)):
+    """测试已保存的 API Key"""
+    result = await db.execute(select(ApiKey).where(ApiKey.id == key_id))
+    key = result.scalar_one_or_none()
+    if not key:
+        raise HTTPException(404, "Key 不存在")
+
+    api_key = _decrypt(key.encrypted_key)
+    test_result = await _do_test(key.provider, api_key)
+
+    # Update last_tested_at
+    await db.execute(
+        update(ApiKey).where(ApiKey.id == key_id).values(
+            last_tested_at=datetime.now(timezone.utc)
+        )
+    )
+    await db.commit()
+
+    return test_result
+
+
+async def _do_test(provider: str, api_key: str) -> dict:
+    """实际测试 API Key"""
+    if provider not in PROVIDERS:
+        raise HTTPException(400, f"不支持的服务商: {provider}")
+
+    cfg = PROVIDERS[provider]
+    base_url = cfg["base_url"].rstrip("/")
+    test_path = cfg["test_path"]
+    url = f"{base_url}{test_path}"
+    auth_value = f"{cfg['auth_prefix']} {api_key}" if cfg.get("auth_prefix") else api_key
+    headers = {cfg["auth_header"]: auth_value, "Content-Type": "application/json"}
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers=headers)
+
+            if resp.status_code in (200, 401, 403):
+                # 200 = success, 401/403 = key invalid but endpoint reached
+                ok = resp.status_code == 200
+                detail = ""
+                if not ok:
+                    try:
+                        detail = resp.json()
+                    except Exception:
+                        detail = resp.text[:200]
+                return {"ok": ok, "status": resp.status_code, "detail": str(detail)[:200] if detail else ""}
+            else:
+                # Try a minimal chat completion as fallback
+                chat_url = f"{base_url}/chat/completions"
+                body = {
+                    "model": cfg["models"][0],
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1,
+                }
+                resp2 = await client.post(chat_url, headers=headers, json=body)
+                ok = resp2.status_code == 200
+                return {
+                    "ok": ok,
+                    "status": resp2.status_code,
+                    "detail": "" if ok else (resp2.text[:200]),
+                }
+    except httpx.ConnectError:
+        return {"ok": False, "status": 0, "detail": "无法连接到服务商 API，请检查网络"}
+    except Exception as e:
+        return {"ok": False, "status": 0, "detail": str(e)[:200]}
+
+
+
+# ─── 当前模型查询 ──────────────────────────────────────────────
+
+
+@router.get("/has-key")
+async def check_has_key(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """检查当前用户是否配置了 API Key"""
+    result = await db.execute(
+        select(ApiKey).where(
+            ApiKey.user_id == current_user.id,
+            ApiKey.is_active == True
+        ).limit(1)
+    )
+    key = result.scalar_one_or_none()
+    return {"has_key": key is not None}
+
+
+
+@router.get("/models")
+async def get_current_models(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """返回当前用户使用的 AI 模型（从用户的 API Key 读取）"""
+    # 从用户的 API Key 中获取模型
+    result = await db.execute(
+        select(ApiKey).where(
+            ApiKey.user_id == current_user.id,
+            ApiKey.is_active == True
+        ).order_by(ApiKey.created_at.desc()).limit(1)
+    )
+    api_key = result.scalar_one_or_none()
+    
+    if api_key and api_key.model:
+        return {
+            "generate_model": api_key.model,
+            "review_model": api_key.model,  # 暂时用同一个模型
+            "generate_model_desc": "用于信息提取、岗位分析、简历生成",
+            "review_model_desc": "用于简历质量评估、评审打分",
+        }
+    else:
+        return {
+            "generate_model": None,
+            "review_model": None,
+            "generate_model_desc": "未配置模型，请先添加 API Key",
+            "review_model_desc": "未配置模型，请先添加 API Key",
+        }
+
+
+@router.put("/active-models")
+async def update_active_models(
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """切换活跃模型。body: {generate_model: 'deepseek-v4-pro', review_model: '...'}"""
+    if "generate_model" in data:
+        await set_active_model("generate", data["generate_model"], db)
+    if "review_model" in data:
+        await set_active_model("review", data["review_model"], db)
+    return {
+        "generate_model": _cache_get("generate_model", ""),
+        "review_model": _cache_get("review_model", ""),
+    }
+
+# ─── 旧版兼容 ────────────────────────────────────────────────
+
+@router.get("/settings")
+async def get_settings_legacy():
+    """旧版兼容 — 返回 API Key 列表"""
+    return {"message": "请使用 /api/v1/config/api-keys 获取 Key 列表", "deprecated": True}

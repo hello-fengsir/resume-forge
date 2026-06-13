@@ -1,0 +1,111 @@
+"""信息条目 CRUD 路由"""
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database import get_db
+from app.models.info_entry import InfoEntry, InfoCategory
+
+router = APIRouter()
+
+
+@router.get("/entries")
+async def list_entries(
+    category: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """列出信息条目，支持按分类筛选"""
+    from sqlalchemy import select
+    stmt = select(InfoEntry).order_by(InfoEntry.created_at.desc())
+    if category:
+        stmt = stmt.where(InfoEntry.category == category)
+    result = await db.execute(stmt)
+    entries = result.scalars().all()
+    return [
+        {
+            "id": str(e.id),
+            "category": e.category.value,
+            "title": e.title,
+            "company": e.company,
+            "start_date": e.start_date.isoformat() if e.start_date else None,
+            "end_date": e.end_date.isoformat() if e.end_date else None,
+            "content": e.content,
+            "raw_input": e.raw_input,
+            "source_file": e.source_file,
+            "created_at": e.created_at.isoformat(),
+            "updated_at": e.updated_at.isoformat(),
+        }
+        for e in entries
+    ]
+
+
+@router.get("/entries/{entry_id}")
+async def get_entry(entry_id: str, db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import select
+    from uuid import UUID
+    stmt = select(InfoEntry).where(InfoEntry.id == UUID(entry_id))
+    result = await db.execute(stmt)
+    e = result.scalar_one_or_none()
+    if not e:
+        raise HTTPException(404, "条目不存在")
+    return {
+        "id": str(e.id),
+        "category": e.category.value,
+        "title": e.title,
+        "company": e.company,
+        "start_date": e.start_date.isoformat() if e.start_date else None,
+        "end_date": e.end_date.isoformat() if e.end_date else None,
+        "content": e.content,
+        "raw_input": e.raw_input,
+        "source_file": e.source_file,
+        "created_at": e.created_at.isoformat(),
+        "updated_at": e.updated_at.isoformat(),
+    }
+
+
+@router.post("/entries", status_code=201)
+async def create_entry(data: dict, db: AsyncSession = Depends(get_db)):
+    entry = InfoEntry(
+        category=data.get("category", "work_experience"),
+        title=data.get("title", ""),
+        company=data.get("company"),
+        content=data.get("content"),
+        raw_input=data.get("raw_input"),
+        start_date=data.get("start_date"),
+        end_date=data.get("end_date"),
+    )
+    db.add(entry)
+    await db.commit()
+    await db.refresh(entry)
+    return {"id": str(entry.id), "title": entry.title, "category": entry.category.value}
+
+
+@router.put("/entries/{entry_id}")
+async def update_entry(entry_id: str, data: dict, db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import select
+    from uuid import UUID
+    stmt = select(InfoEntry).where(InfoEntry.id == UUID(entry_id))
+    result = await db.execute(stmt)
+    entry = result.scalar_one_or_none()
+    if not entry:
+        raise HTTPException(404, "条目不存在")
+
+    for field in ["category", "title", "company", "content", "raw_input", "start_date", "end_date"]:
+        if field in data:
+            setattr(entry, field, data[field])
+
+    await db.commit()
+    await db.refresh(entry)
+    return {"id": str(entry.id), "title": entry.title, "updated": True}
+
+
+@router.delete("/entries/{entry_id}")
+async def delete_entry(entry_id: str, db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import select
+    from uuid import UUID
+    stmt = select(InfoEntry).where(InfoEntry.id == UUID(entry_id))
+    result = await db.execute(stmt)
+    entry = result.scalar_one_or_none()
+    if not entry:
+        raise HTTPException(404, "条目不存在")
+    await db.delete(entry)
+    await db.commit()
+    return {"deleted": True}

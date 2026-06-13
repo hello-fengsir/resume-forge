@@ -1,0 +1,34 @@
+# Environment
+.env
+*.env.local
+
+# Data
+data/pgdata/
+uploads/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+
+# Node
+node_modules/
+dist/
+.output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
