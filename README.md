@@ -120,6 +120,20 @@ resume-forge/
 
 启动后访问: http://localhost:8017/docs
 
+## 📸 产品截图
+
+### 信息统计 — 履历数据管理
+
+<p align="center">
+  <img src="images/信息统计.png" width="800" alt="信息统计">
+</p>
+
+### 制作简历 — AI 定制生成
+
+<p align="center">
+  <img src="images/制作简历.png" width="800" alt="制作简历">
+</p>
+
 ## 🤝 贡献指南
 
 欢迎提交 Issue 和 Pull Request！
